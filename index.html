@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>摆线针轮减速机 3D 仿真</title>
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#1c1f23;
+               font-family:"Segoe UI","Microsoft YaHei",sans-serif; }
+  #app { position:fixed; inset:0; }
+  /* ---------- 侧边控制面板 ---------- */
+  #panel { position:fixed; top:16px; right:16px; width:238px; padding:14px 16px;
+           background:rgba(22,26,31,.88); border:1px solid #3a4149; border-radius:10px;
+           color:#cfd6dd; font-size:13px; backdrop-filter:blur(4px); user-select:none; }
+  #panel h1 { font-size:15px; margin:0 0 2px; color:#e8ecf0; font-weight:600; letter-spacing:1px; }
+  #panel .sub { font-size:11px; color:#7d8791; margin-bottom:12px; }
+  .row { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .row label { color:#9aa4ae; }
+  .row span, .row b { color:#e8a33d; font-variant-numeric:tabular-nums; font-weight:600; }
+  input[type=range] { width:100%; accent-color:#e8a33d; margin:2px 0 12px; }
+  .btns { display:flex; gap:8px; margin-bottom:12px; }
+  button { flex:1; background:#333b44; color:#dfe5eb; border:1px solid #4a545f;
+           border-radius:6px; padding:6px 0; font-size:13px; cursor:pointer; }
+  button:hover { background:#414b56; }
+  .stats { border-top:1px solid #333b44; padding-top:10px; display:grid; gap:6px; }
+  .stats .row { margin:0; }
+  .stats b { color:#e8ecf0; }
+  #mesh.ok  { color:#6fcf7f; }
+  #mesh.bad { color:#e06060; }
+  .legend { border-top:1px solid #333b44; margin-top:10px; padding-top:8px;
+            display:grid; gap:4px; font-size:11px; color:#9aa4ae; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px;
+              margin-right:6px; vertical-align:-1px; }
+  #hint { position:fixed; left:16px; bottom:14px; color:#8b959f; font-size:12px;
+          background:rgba(22,26,31,.6); padding:5px 10px; border-radius:6px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="panel">
+  <h1>摆线针轮减速机</h1>
+  <div class="sub">Cycloidal Drive · 一级减速 i = 11</div>
+  <div class="row"><label>输入转速</label><span id="rpmVal">60 rpm</span></div>
+  <input id="rpm" type="range" min="0" max="240" step="1" value="60">
+  <div class="btns">
+    <button id="toggle">暂 停</button>
+    <button id="reset">重置视角</button>
+  </div>
+  <div class="stats">
+    <div class="row"><label>输入转速</label><b id="inRpm">60.0 rpm</b></div>
+    <div class="row"><label>输出转速</label><b id="outRpm">-5.45 rpm</b></div>
+    <div class="row"><label>减速比</label><b>11 : 1（反向）</b></div>
+    <div class="row"><label>啮合校验</label><b id="mesh" class="ok">正常</b></div>
+  </div>
+  <div class="legend">
+    <span><i style="background:#c08a3e"></i>摆线轮（11 齿）</span>
+    <span><i style="background:#d7dce2"></i>针齿 / 输出销轴</span>
+    <span><i style="background:#9aa1a8"></i>偏心轴 · 输出法兰</span>
+    <span><i style="background:#4b5158"></i>针齿壳 · 支架</span>
+  </div>
+</div>
+<div id="hint">左键拖拽旋转 · 滚轮缩放 · 右键平移</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+/* =====================================================================
+ * 机构参数（已经数值校验：节曲线最小曲率半径 4.396 > 针齿半径 4，无根切；
+ * 整周啮合间隙 ≈ 0；输出销孔与销轴恒相切）
+ * ===================================================================== */
+const P = {
+  pinCount: 12,   // 针齿数 Zp（固定于针齿壳）
+  Rp: 60,         // 针齿分布圆半径
+  pinR: 4,        // 针齿半径
+  ecc: 2.2,       // 偏心距 e
+  discT: 10,      // 摆线轮厚度
+  camR: 10,       // 偏心凸轮半径
+  outPins: 6,     // 输出销轴数
+  outPinR: 4,     // 输出销轴半径
+  outR: 30,       // 输出销轴分布圆半径
+};
+const ZC = P.pinCount - 1;        // 摆线轮齿数 = 减速比 i = 11
+const HOLE_R = P.outPinR + P.ecc + 0.25;  // 输出销孔半径 = 销半径 + e（+视觉间隙）
+const BORE_R = P.camR + P.ecc + 0.25;     // 中心孔半径 = 凸轮半径 + e
+
+/* =====================================================================
+ * 渲染器 / 场景 / 相机
+ * ===================================================================== */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;      // 软阴影
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.getElementById('app').appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1c1f23);
+
+const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 2000);
+const CAM_HOME = new THREE.Vector3(105, 62, 140);
+const TGT_HOME = new THREE.Vector3(0, 0, 4);
+camera.position.copy(CAM_HOME);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(TGT_HOME);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxDistance = 600;
+controls.update();
+
+/* ---------- 灯光：环境光 + 方向光（2048 阴影贴图） ---------- */
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a2c30, 0.55));
+const sun = new THREE.DirectionalLight(0xfff4e6, 1.8);
+sun.position.set(90, 130, 70);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -110, right: 110, top: 110, bottom: -110, near: 10, far: 420 });
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0xbfd0e0, 0.35);   // 补光，无阴影
+fill.position.set(-70, 50, -90);
+scene.add(fill);
+
+/* ---------- 地面 ---------- */
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(800, 800),
+  new THREE.MeshStandardMaterial({ color: 0x23262a, roughness: 0.95, metalness: 0 })
+);
+ground.rotation.x = -Math.PI / 2;
+ground.position.y = -90;
+ground.receiveShadow = true;
+scene.add(ground);
+
+/* =====================================================================
+ * 材质（简约工业写实）
+ * ===================================================================== */
+const M = {
+  steel:   new THREE.MeshStandardMaterial({ color: 0x9aa1a8, metalness: 0.85, roughness: 0.35 }),
+  dark:    new THREE.MeshStandardMaterial({ color: 0x4b5158, metalness: 0.70, roughness: 0.50 }),
+  disc:    new THREE.MeshStandardMaterial({ color: 0xc08a3e, metalness: 0.80, roughness: 0.35 }),
+  pin:     new THREE.MeshStandardMaterial({ color: 0xd7dce2, metalness: 0.90, roughness: 0.25 }),
+  flange:  new THREE.MeshStandardMaterial({ color: 0x707a85, metalness: 0.80, roughness: 0.40 }),
+  bracket: new THREE.MeshStandardMaterial({ color: 0x3f464d, metalness: 0.40, roughness: 0.70 }),
+  marker:  new THREE.MeshStandardMaterial({ color: 0xe8a33d, metalness: 0.30, roughness: 0.50,
+                                            emissive: 0x5a3a08 }),
+  shell:   new THREE.MeshStandardMaterial({ color: 0xa8c0d8, metalness: 0.10, roughness: 0.15,
+                                            transparent: true, opacity: 0.13, side: THREE.DoubleSide,
+                                            depthWrite: false }),
+};
+
+/* 工具：圆柱（默认 Y 轴 -> 转为沿 Z 轴） */
+function zCylinder(r, len, mat, seg = 40) {
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, seg), mat);
+  m.rotation.x = Math.PI / 2;
+  return m;
+}
+/* 工具：圆环板（XY 平面，沿 Z 拉伸） */
+function ringMesh(rOut, rIn, thick, mat) {
+  const s = new THREE.Shape();
+  s.absarc(0, 0, rOut, 0, Math.PI * 2, false);
+  const h = new THREE.Path();
+  h.absarc(0, 0, rIn, 0, Math.PI * 2, true);
+  s.holes.push(h);
+  const g = new THREE.ExtrudeGeometry(s, { depth: thick, bevelEnabled: false });
+  g.translate(0, 0, -thick / 2);
+  return new THREE.Mesh(g, mat);
+}
+
+/* =====================================================================
+ * 摆线轮齿廓：短幅外摆线节曲线向内等距偏移一个针齿半径
+ *   节曲线  x = Rp·cos t − e·cos(Zp·t)
+ *           y = Rp·sin t − e·sin(Zp·t)
+ * ===================================================================== */
+function cycloidProfile(samples) {
+  const N = P.pinCount, e = P.ecc, Rp = P.Rp, rr = P.pinR;
+  const pts = [];
+  for (let i = 0; i < samples; i++) {
+    const t = i / samples * Math.PI * 2;
+    pts.push(new THREE.Vector2(Rp * Math.cos(t) - e * Math.cos(N * t),
+                               Rp * Math.sin(t) - e * Math.sin(N * t)));
+  }
+  // 沿内法线偏移 rr，得到实际齿廓
+  const out = [];
+  for (let i = 0; i < samples; i++) {
+    const p = pts[i], q = pts[(i + 1) % samples];
+    const tx = q.x - p.x, ty = q.y - p.y;
+    const L = Math.hypot(tx, ty);
+    let nx = -ty / L, ny = tx / L;
+    if (nx * p.x + ny * p.y > 0) { nx = -nx; ny = -ny; }  // 法线朝内
+    out.push(new THREE.Vector2(p.x + nx * rr, p.y + ny * rr));
+  }
+  return out;
+}
+
+/* ---------- 摆线轮（含中心孔与 6 个输出销孔） ---------- */
+const discGroup = new THREE.Group();
+{
+  const shape = new THREE.Shape(cycloidProfile(720));
+  const bore = new THREE.Path();
+  bore.absarc(0, 0, BORE_R, 0, Math.PI * 2, true);
+  shape.holes.push(bore);
+  for (let k = 0; k < P.outPins; k++) {
+    const a = k / P.outPins * Math.PI * 2;
+    const h = new THREE.Path();
+    h.absarc(P.outR * Math.cos(a), P.outR * Math.sin(a), HOLE_R, 0, Math.PI * 2, true);
+    shape.holes.push(h);
+  }
+  const g = new THREE.ExtrudeGeometry(shape, { depth: P.discT, bevelEnabled: false });
+  g.translate(0, 0, -P.discT / 2);
+  const disc = new THREE.Mesh(g, M.disc);
+  disc.castShadow = disc.receiveShadow = true;
+  discGroup.add(disc);
+  // 自转标记（便于观察摆动 + 自转的复合运动）
+  const mark = zCylinder(2.5, P.discT + 1, M.marker, 16);
+  mark.position.set(46, 0, 0);
+  discGroup.add(mark);
+}
+scene.add(discGroup);
+
+/* ---------- 针齿壳：12 根固定针齿 + 保持环 ---------- */
+const pinRingGroup = new THREE.Group();
+const pinPos = [];
+for (let j = 0; j < P.pinCount; j++) {
+  const a = j / P.pinCount * Math.PI * 2;
+  const x = P.Rp * Math.cos(a), y = P.Rp * Math.sin(a);
+  pinPos.push({ x, y });
+  const pin = zCylinder(P.pinR, 24, M.pin, 24);
+  pin.position.set(x, y, 0);
+  pin.castShadow = true;
+  pinRingGroup.add(pin);
+}
+for (const zs of [-13.5, 13.5]) {          // 上下保持环
+  const ring = ringMesh(72, 64.5, 3, M.dark);
+  ring.position.z = zs;
+  ring.castShadow = true;
+  pinRingGroup.add(ring);
+}
+scene.add(pinRingGroup);
+
+/* ---------- 偏心轴（输入轴 + 偏心凸轮 + 旋转标记） ---------- */
+const inputGroup = new THREE.Group();
+{
+  const shaft = zCylinder(6, 50, M.steel);          // z: -45 ~ +5
+  shaft.position.z = -20;
+  shaft.castShadow = true;
+  inputGroup.add(shaft);
+  const cam = zCylinder(P.camR, P.discT, M.dark);   // 偏心凸轮，与摆线轮中心孔配合
+  cam.position.set(P.ecc, 0, 0);                    // 偏心距 e，随轴转动
+  cam.castShadow = true;
+  inputGroup.add(cam);
+  const key = new THREE.Mesh(new THREE.BoxGeometry(3, 2.5, 6), M.marker);
+  key.position.set(0, 6.5, -30);                    // 轴端标记（避开轴承座），显示输入转速
+  inputGroup.add(key);
+}
+scene.add(inputGroup);
+
+/* ---------- 输出机构：法兰 + 6 根输出销轴 + 输出轴 ---------- */
+const outputGroup = new THREE.Group();
+{
+  const flange = zCylinder(38, 6, M.flange, 56);    // 输出法兰 z: 19 ~ 25
+  flange.position.z = 22;
+  flange.castShadow = true;
+  outputGroup.add(flange);
+  for (let k = 0; k < P.outPins; k++) {             // 销轴穿过摆线轮销孔
+    const a = k / P.outPins * Math.PI * 2;
+    const pin = zCylinder(P.outPinR, 30, M.pin, 20); // z: -8 ~ +22
+    pin.position.set(P.outR * Math.cos(a), P.outR * Math.sin(a), 7);
+    pin.castShadow = true;
+    outputGroup.add(pin);
+  }
+  const outShaft = zCylinder(8, 30, M.steel);       // 输出轴 z: 22 ~ 52
+  outShaft.position.z = 37;
+  outShaft.castShadow = true;
+  outputGroup.add(outShaft);
+  const mark = new THREE.Mesh(new THREE.BoxGeometry(7, 3, 6.5), M.marker);
+  mark.position.set(33, 0, 22);                     // 法兰边缘标记，显示输出转速
+  outputGroup.add(mark);
+}
+scene.add(outputGroup);
+
+/* ---------- 支架：底座 + 前后轴承支撑 ---------- */
+const bracketGroup = new THREE.Group();
+{
+  const base = new THREE.Mesh(new THREE.BoxGeometry(110, 10, 120), M.bracket);
+  base.position.set(0, -84, 4);
+  base.receiveShadow = base.castShadow = true;
+  bracketGroup.add(base);
+  const supports = [
+    { z: -38, rOut: 16, rIn: 7 },   // 输入端轴承座
+    { z: 44,  rOut: 18, rIn: 9 },   // 输出端轴承座
+  ];
+  for (const s of supports) {
+    const ring = ringMesh(s.rOut, s.rIn, 8, M.dark);
+    ring.position.z = s.z;
+    ring.castShadow = true;
+    bracketGroup.add(ring);
+    const legH = 79 - s.rOut;
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(12, legH, 8), M.bracket);
+    leg.position.set(0, -s.rOut - legH / 2, s.z);
+    leg.castShadow = true;
+    bracketGroup.add(leg);
+  }
+}
+scene.add(bracketGroup);
+
+/* ---------- 外壳（半透明，便于观察内部啮合） ---------- */
+const housingGroup = new THREE.Group();
+{
+  const shellGeo = new THREE.CylinderGeometry(76, 76, 60, 64, 1, true);
+  shellGeo.rotateX(Math.PI / 2);
+  const shell = new THREE.Mesh(shellGeo, M.shell);  // z: -24 ~ +36
+  shell.position.z = 6;
+  housingGroup.add(shell);
+  for (const zs of [-24, 36]) {                     // 前后端盖（半透明环板）
+    const cap = ringMesh(76, 26, 3, M.shell);
+    cap.position.z = zs;
+    housingGroup.add(cap);
+  }
+  const brgF = ringMesh(12, 8.5, 5, M.dark);        // 前轴承
+  brgF.position.z = 36;
+  housingGroup.add(brgF);
+  const brgB = ringMesh(10, 6.5, 5, M.dark);        // 后轴承
+  brgB.position.z = -24;
+  housingGroup.add(brgB);
+}
+scene.add(housingGroup);
+
+/* =====================================================================
+ * 可选外部模型：将自行下载的轻量化低模（GLB）放到 models/ 目录即可自动
+ * 加载并替换程序化外壳；加载失败（如 file:// 跨域、文件不存在）时自动
+ * 回退到上面的基础几何体外壳，不影响仿真运行。
+ * ===================================================================== */
+(function tryLoadExternalModel() {
+  const url = 'models/cycloidal_reducer.glb';
+  try {
+    new GLTFLoader().load(url, (gltf) => {
+      const model = gltf.scene;
+      // 自动缩放对齐：包围球半径归一到外壳尺寸，中心对齐主轴
+      const box = new THREE.Box3().setFromObject(model);
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      const s = 78 / sphere.radius;
+      model.scale.setScalar(s);
+      model.position.copy(sphere.center).multiplyScalar(-s).add(new THREE.Vector3(0, 0, 6));
+      model.traverse(o => { if (o.isMesh) { o.castShadow = false; o.receiveShadow = true; } });
+      scene.remove(housingGroup);          // 用低模替换程序化外壳
+      scene.add(model);
+      console.log('[模型] 已加载外部低模:', url);
+    }, undefined, () => {
+      console.log('[模型] 外部模型加载失败，使用程序化基础几何体外壳。');
+    });
+  } catch (e) {
+    console.log('[模型] 外部模型不可用，使用程序化基础几何体外壳。');
+  }
+})();
+
+/* =====================================================================
+ * 交互：转速滑块 / 启停 / 视角重置
+ * ===================================================================== */
+let rpm = 60;          // 输入转速设定值
+let running = true;    // 启停状态
+const $ = id => document.getElementById(id);
+
+$('rpm').addEventListener('input', e => {
+  rpm = +e.target.value;
+  $('rpmVal').textContent = rpm + ' rpm';
+});
+$('toggle').addEventListener('click', () => {
+  running = !running;
+  $('toggle').textContent = running ? '暂 停' : '启 动';
+});
+$('reset').addEventListener('click', () => {
+  camera.position.copy(CAM_HOME);
+  controls.target.copy(TGT_HOME);
+  controls.update();
+});
+
+/* =====================================================================
+ * 运动学（核心）
+ *   输入轴转角 θ（偏心轴）
+ *   摆线轮中心  C = e·(cosθ, sinθ)      —— 行星公转（摆动）
+ *   摆线轮自转  β = −θ / ZC             —— 反向，ZC = 11
+ *   输出法兰转角 = β                    —— 经销轴-销孔等速输出
+ * ===================================================================== */
+let theta = 0;
+const checkPts = cycloidProfile(144);    // 啮合校验用采样点（摆线轮局部坐标）
+let frame = 0;
+
+function meshClearance(cx, cy, beta) {
+  // 摆线轮实际齿廓到最近针齿表面的最小间隙（负值 = 干涉）
+  let minC = Infinity;
+  const cb = Math.cos(beta), sb = Math.sin(beta);
+  for (const q of checkPts) {
+    const wx = cx + cb * q.x - sb * q.y;
+    const wy = cy + sb * q.x + cb * q.y;
+    for (const pn of pinPos) {
+      const d = Math.hypot(wx - pn.x, wy - pn.y) - P.pinR;
+      if (d < minC) minC = d;
+    }
+  }
+  return minC;
+}
+
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if (running && rpm > 0) {
+    theta += rpm * Math.PI * 2 / 60 * dt;   // 输入轴角位移
+  }
+
+  // ---- 摆线轮复合运动：公转 + 自转 ----
+  let cx = P.ecc * Math.cos(theta);
+  let cy = P.ecc * Math.sin(theta);
+  // 活动范围限制：摆线轮中心轨迹必须保持在半径 e 的圆上，防止穿插错位
+  const cl = Math.hypot(cx, cy);
+  if (cl > P.ecc) { cx *= P.ecc / cl; cy *= P.ecc / cl; }
+  const beta = -theta / ZC;
+
+  inputGroup.rotation.z = theta;          // 偏心轴（凸轮随轴公转）
+  discGroup.position.set(cx, cy, 0);      // 摆线轮行星摆动
+  discGroup.rotation.z = beta;            // 摆线轮低速反向自转
+  outputGroup.rotation.z = beta;          // 输出端等速低速输出
+
+  // ---- 啮合校验（每 4 帧一次）----
+  if ((frame++ & 3) === 0) {
+    const c = meshClearance(cx, cy, beta);
+    const el = $('mesh');
+    if (c < -0.5) { el.textContent = '干涉!'; el.className = 'bad'; }
+    else { el.textContent = '正常 ' + (c >= 0 ? '+' : '') + c.toFixed(2); el.className = 'ok'; }
+    // 实时数值
+    const w = running ? rpm : 0;
+    $('inRpm').textContent = w.toFixed(1) + ' rpm';
+    $('outRpm').textContent = (-w / ZC).toFixed(2) + ' rpm';
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
